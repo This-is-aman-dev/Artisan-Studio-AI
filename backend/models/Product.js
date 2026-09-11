@@ -19,6 +19,11 @@ const productSchema = new mongoose.Schema(
       enum: ["available", "sold_out"],
       default: "available",
     },
+    artisan: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+    },
     soldAt: { type: Date, default: null },
   },
   { timestamps: true }

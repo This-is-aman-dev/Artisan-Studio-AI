@@ -1,18 +1,33 @@
 import React, { useState, useEffect } from "react";
 import axios from "axios";
-import { Package, IndianRupee, CheckCircle, AlertCircle, Trash2, ArrowLeft, RefreshCw, ShoppingBag } from "lucide-react";
+import { Package, IndianRupee, CheckCircle, Trash2, ArrowLeft, RefreshCw, ShoppingBag, Share2, LogOut } from "lucide-react";
 
-export default function SellerDashboard({ onBackToCreator }) {
+export default function SellerDashboard({ onBackToCreator, user, token, onLogout, onRequestLogin }) {
   const [products, setProducts] = useState([]);
   const [loading, setLoading] = useState(true);
 
+  const authHeaders = {
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+  };
+
   const fetchProducts = async () => {
+    if (!token) {
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     try {
-      const res = await axios.get("http://127.0.0.1:5000/api/products/all");
+      const res = await axios.get("http://127.0.0.1:5000/api/products/all", authHeaders);
       setProducts(res.data);
     } catch (err) {
-      alert("Failed to load inventory: " + err.message);
+      if (err.response?.status === 401) {
+        alert("Session expired. Please log in again.");
+        onLogout();
+      } else {
+        alert("Failed to load inventory: " + (err.response?.data?.error || err.message));
+      }
     } finally {
       setLoading(false);
     }
@@ -20,29 +35,53 @@ export default function SellerDashboard({ onBackToCreator }) {
 
   useEffect(() => {
     fetchProducts();
-  }, []);
+  }, [token]);
 
   const toggleStatus = async (id, currentStatus) => {
     const nextStatus = currentStatus === "available" ? "sold_out" : "available";
     try {
-      await axios.patch(`http://127.0.0.1:5000/api/products/${id}/status`, { status: nextStatus });
+      await axios.patch(`http://127.0.0.1:5000/api/products/${id}/status`, { status: nextStatus }, authHeaders);
       setProducts((prev) =>
         prev.map((item) => (item._id === id ? { ...item, status: nextStatus } : item))
       );
     } catch (err) {
-      alert("Failed to update status: " + err.message);
+      alert("Failed to update status: " + (err.response?.data?.error || err.message));
     }
   };
 
   const deleteProduct = async (id) => {
     if (!window.confirm("Are you sure you want to delete this listing?")) return;
     try {
-      await axios.delete(`http://127.0.0.1:5000/api/products/${id}`);
+      await axios.delete(`http://127.0.0.1:5000/api/products/${id}`, authHeaders);
       setProducts((prev) => prev.filter((item) => item._id !== id));
     } catch (err) {
-      alert("Failed to delete product: " + err.message);
+      alert("Failed to delete product: " + (err.response?.data?.error || err.message));
     }
   };
+
+  if (!token) {
+    return (
+      <div style={{ maxWidth: 600, margin: "60px auto", textAlign: "center", padding: 24 }}>
+        <h2>Artisan Inventory Portal</h2>
+        <p style={{ color: "#64748b" }}>Please login to manage your published crafts and pricing.</p>
+        <button
+          onClick={onRequestLogin}
+          style={{
+            marginTop: 16,
+            padding: "10px 20px",
+            background: "#d35400",
+            color: "#fff",
+            border: "none",
+            borderRadius: 8,
+            cursor: "pointer",
+            fontWeight: 600,
+          }}
+        >
+          Login / Register
+        </button>
+      </div>
+    );
+  }
 
   // KPI Calculations
   const totalItems = products.length;
@@ -54,7 +93,33 @@ export default function SellerDashboard({ onBackToCreator }) {
 
   return (
     <div style={{ maxWidth: 800, margin: "20px auto", fontFamily: "sans-serif", padding: 16 }}>
-      {/* Top Navigation */}
+      {/* Top Header */}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+        <div>
+          <h3 style={{ margin: 0, color: "#1e293b" }}>{user?.name || "Artisan"}'s Workspace</h3>
+          <span style={{ fontSize: 12, color: "#64748b" }}>{user?.craftSpecialty || "Craft Studio"} • {user?.phone}</span>
+        </div>
+        <button
+          onClick={onLogout}
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+            background: "none",
+            border: "1px solid #e2e8f0",
+            padding: "6px 12px",
+            borderRadius: 8,
+            cursor: "pointer",
+            color: "#dc2626",
+            fontSize: 12,
+            fontWeight: 600,
+          }}
+        >
+          <LogOut size={14} /> Logout
+        </button>
+      </div>
+
+      {/* Navigation & Refresh */}
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
         <button
           onClick={onBackToCreator}
@@ -127,7 +192,7 @@ export default function SellerDashboard({ onBackToCreator }) {
         <p style={{ color: "#64748b" }}>Loading inventory...</p>
       ) : products.length === 0 ? (
         <div style={{ textAlign: "center", padding: 40, border: "2px dashed #cbd5e1", borderRadius: 12 }}>
-          <p style={{ color: "#64748b" }}>No products published yet.</p>
+          <p style={{ color: "#64748b" }}>No products published yet in your account.</p>
         </div>
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
@@ -178,7 +243,7 @@ export default function SellerDashboard({ onBackToCreator }) {
                   <span style={{ color: "#b45309" }}>Floor: ₹{item.pricing?.floorPrice}</span>
                 </div>
 
-                <div style={{ display: "flex", gap: 8 }}>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                   <button
                     onClick={() => toggleStatus(item._id, item.status)}
                     style={{
@@ -194,6 +259,35 @@ export default function SellerDashboard({ onBackToCreator }) {
                   >
                     {item.status === "sold_out" ? "Mark In-Stock" : "Mark as Sold"}
                   </button>
+
+                  <button
+                    onClick={() => {
+                      const text = encodeURIComponent(
+                        `*${item.titleEn}*\n` +
+                        `Price: ₹${item.pricing?.recommendedPrice}\n` +
+                        `Category: ${item.category} (${item.material})\n\n` +
+                        `${item.descriptionEn}\n\n` +
+                        `Photo: ${item.imageUrl}`
+                      );
+                      window.open(`https://api.whatsapp.com/send?text=${text}`, "_blank");
+                    }}
+                    style={{
+                      fontSize: 12,
+                      padding: "6px 10px",
+                      borderRadius: 6,
+                      border: "1px solid #25D366",
+                      background: "#fff",
+                      color: "#25D366",
+                      cursor: "pointer",
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 4,
+                      fontWeight: 600,
+                    }}
+                  >
+                    <Share2 size={14} /> WhatsApp
+                  </button>
+
                   <button
                     onClick={() => deleteProduct(item._id)}
                     style={{
