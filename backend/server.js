@@ -10,6 +10,9 @@ import { fileURLToPath } from "url";
 import authRoutes from "./routes/authRoutes.js";
 import productRoutes from "./routes/productRoutes.js";
 
+// Service imports
+import { pricingService } from "./services/pricingService.js";
+
 // Load environment variables from .env
 dotenv.config();
 
@@ -49,10 +52,18 @@ const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/artisan_st
 
 mongoose
   .connect(MONGO_URI)
-  .then(() => {
+  .then(async () => {
     console.log("Connected to MongoDB database: artisan_studio_db");
-    app.listen(PORT, () => {
-      console.log(`Server running on http://127.0.0.1:${PORT}`);
+
+    // Load benchmarks from Artisan_Dataset_Cleaned.xlsx
+    try {
+      await pricingService.seedFromExcel();
+    } catch (seedErr) {
+      console.warn("Dataset seed warning:", seedErr.message);
+    }
+
+    app.listen(PORT, "0.0.0.0", () => {
+      console.log(`Server running on port ${PORT} (All interfaces: 0.0.0.0)`);
     });
   })
   .catch((err) => {

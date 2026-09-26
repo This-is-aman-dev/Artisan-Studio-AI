@@ -1,8 +1,12 @@
 import express from "express";
 import multer from "multer";
 import fs from "fs";
+import path from "path";
 import Groq from "groq-sdk";
 import Product from "../models/Product.js";
+import Order from "../models/Order.js";
+import PricingBenchmark from "../models/PricingBenchmark.js";
+import { pricingService } from "../services/pricingService.js";
 import { verifyToken } from "../middleware/auth.js";
 
 const router = express.Router();
@@ -36,22 +40,95 @@ const safeUnlink = (filePath) => {
   }
 };
 
-// 1. Process Voice + Manual Costing Route (Groq AI)
-router.post("/process-voice", upload.single("audio"), async (req, res) => {
-  const uploadedFilePath = req.file ? req.file.path : null;
+// ============================================================================
+// 1. Dynamic Dropdown Options directly from MongoDB Pricing Benchmark Dataset
+// ============================================================================
+router.get("/dataset-options", async (req, res) => {
+  try {
+    const benchmarks = await PricingBenchmark.find(
+      {},
+      {
+        category: 1,
+        productName: 1,
+        material: 1,
+        rawMaterialCost: 1,
+        laborHours: 1,
+        minRawCost: 1,
+        maxRawCost: 1,
+        minHours: 1,
+        maxHours: 1,
+      }
+    ).sort({ category: 1, productName: 1 });
+
+    // Group items and materials dynamically by category
+    const categoryMap = {};
+
+    benchmarks.forEach((doc) => {
+      const cat = doc.category || "Handicrafts";
+      if (!categoryMap[cat]) {
+        categoryMap[cat] = {
+          items: [],
+          materials: new Set(),
+        };
+      }
+
+      // Add item record with its baseline metrics
+      categoryMap[cat].items.push({
+        productName: doc.productName,
+        material: doc.material || "Handcrafted Material",
+        rawMaterialCost: doc.rawMaterialCost || doc.minRawCost || 0,
+        laborHours: doc.laborHours || doc.minHours || 1,
+        minRawCost: doc.minRawCost || 0,
+        maxRawCost: doc.maxRawCost || 0,
+        minHours: doc.minHours || 0,
+        maxHours: doc.maxHours || 0,
+      });
+
+      // Split comma/slash separated materials into clean options
+      if (doc.material) {
+        doc.material.split(/[,/]+/).forEach((m) => {
+          const clean = m.trim();
+          if (clean) categoryMap[cat].materials.add(clean);
+        });
+      }
+    });
+
+    // Format for client consumption
+    const categories = Object.keys(categoryMap).sort();
+    const formattedData = {};
+
+    categories.forEach((cat) => {
+      formattedData[cat] = {
+        items: categoryMap[cat].items,
+        materials: Array.from(categoryMap[cat].materials).sort(),
+      };
+    });
+
+    return res.json({
+      categories,
+      data: formattedData,
+    });
+  } catch (error) {
+    console.error("Error fetching dataset dropdown options:", error);
+    return res.status(500).json({ error: "Failed to load dataset options" });
+  }
+});
+
+// ============================================================================
+// 2. Process Voice + AI Extraction + Dataset-Assisted Fair Pricing
+// ============================================================================
+router.post("/process-voice", upload.any(), async (req, res) => {
+  // Check if audio file was uploaded
+  const audioFile = req.files?.find((f) => f.fieldname === "audio");
+  const uploadedFilePath = audioFile ? audioFile.path : null;
 
   try {
-    const { manualNotes, manualRawCost, manualHours } = req.body;
+    const { manualNotes, manualRawCost, manualHours, location, craftSpecialty, category, material } = req.body;
     let voiceText = "";
 
-    if (!process.env.GROQ_API_KEY) {
-      return res.status(500).json({ error: "GROQ_API_KEY is not configured in .env" });
-    }
-
-    const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
-
-    // Step A: Transcribe audio if present
-    if (uploadedFilePath) {
+    // Step A: Transcribe audio with Groq Whisper if present
+    if (uploadedFilePath && process.env.GROQ_API_KEY) {
+      const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
       try {
         const transcription = await groq.audio.transcriptions.create({
           file: fs.createReadStream(uploadedFilePath),
@@ -68,6 +145,8 @@ router.post("/process-voice", upload.single("audio"), async (req, res) => {
     const combinedContext = `
 Voice Input: ${voiceText || "None"}
 Manual Notes: ${manualNotes || "None"}
+Category: ${category || "Infer from context"}
+Material: ${material || "Infer from context"}
 User Specified Raw Material Cost: ${manualRawCost ? `₹${manualRawCost}` : "Extract from context"}
 User Specified Labor Hours: ${manualHours ? `${manualHours} hours` : "Extract from context"}
     `.trim();
@@ -76,73 +155,80 @@ User Specified Labor Hours: ${manualHours ? `${manualHours} hours` : "Extract fr
     let parsed = {
       titleEn: manualNotes ? manualNotes.split(".")[0].slice(0, 40) : "Handcrafted Artisan Item",
       titleHi: "हस्तनिर्मित पारंपरिक शिल्प",
-      category: "Handicrafts & Decor",
-      material: "Natural / Handcrafted Material",
+      category: category || "Pottery & Terracotta",
+      material: material || "Natural / Handcrafted Material",
       descriptionEn: manualNotes || "Authentic artisanal item handcrafted using traditional techniques.",
       descriptionHi: "कुशल कारीगरों द्वारा पारंपरिक कला से तैयार किया गया प्रामाणिक उत्पाद।",
       rawCost: Number(manualRawCost) || 150,
       hours: Number(manualHours) || 4,
     };
 
-    // Step C: Attempt structured AI generation with standard, high-limit model
-    try {
-      const selectedModel = "llama-3.1-8b-instant"; // Fast with high token allowances
-
-      const completion = await groq.chat.completions.create({
-        model: selectedModel,
-        response_format: { type: "json_object" },
-        max_tokens: 450,
-        messages: [
-          {
-            role: "system",
-            content: `You extract e-commerce listing details for Indian micro-entrepreneurs and artisans.
+    // Step C: Structured AI generation using Groq LLaMA
+    if (process.env.GROQ_API_KEY) {
+      try {
+        const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+        const completion = await groq.chat.completions.create({
+          model: "llama-3.1-8b-instant",
+          response_format: { type: "json_object" },
+          max_tokens: 450,
+          messages: [
+            {
+              role: "system",
+              content: `You extract e-commerce listing details for Indian micro-entrepreneurs and artisans.
 Return ONLY valid JSON with this schema:
 {
   "titleEn": "Concise product title in English (max 6 words)",
   "titleHi": "हिंदी शीर्षक (अधिकतम 6 शब्द)",
-  "category": "Handloom / Terracotta / Metal / Woodcraft / Jewelry",
-  "material": "Material used",
+  "category": "Standard category name",
+  "material": "Primary material used",
   "descriptionEn": "Compelling story under 50 words",
   "descriptionHi": "संक्षिप्त हिंदी विवरण 50 शब्दों में",
   "rawCost": 0,
   "hours": 0
 }`,
-          },
-          {
-            role: "user",
-            content: combinedContext,
-          },
-        ],
-      });
+            },
+            {
+              role: "user",
+              content: combinedContext,
+            },
+          ],
+        });
 
-      const rawContent = completion.choices[0]?.message?.content || "{}";
-      const cleanContent = rawContent.replace(/^```json/g, "").replace(/```$/g, "").trim();
-      const aiParsed = JSON.parse(cleanContent);
-      parsed = { ...parsed, ...aiParsed };
-    } catch (aiErr) {
-      console.warn("Groq listing parse fallback triggered:", aiErr.message);
-      if (manualNotes) {
-        parsed.titleEn = manualNotes.split(/[.,\n]/)[0].trim().slice(0, 40);
-        parsed.descriptionEn = manualNotes.trim();
+        const rawContent = completion.choices[0]?.message?.content || "{}";
+        const cleanContent = rawContent.replace(/^```json/g, "").replace(/```$/g, "").trim();
+        const aiParsed = JSON.parse(cleanContent);
+        parsed = { ...parsed, ...aiParsed };
+
+        if (category) parsed.category = category;
+        if (material) parsed.material = material;
+      } catch (aiErr) {
+        console.warn("Groq listing parse fallback triggered:", aiErr.message);
+        if (manualNotes) {
+          parsed.titleEn = manualNotes.split(/[.,\n]/)[0].trim().slice(0, 40);
+          parsed.descriptionEn = manualNotes.trim();
+        }
       }
     }
 
-    // Step D: Calculate 3-tier pricing
-    const rawCost = Number(manualRawCost) || Number(parsed.rawCost) || 150;
-    const hours = Number(manualHours) || Number(parsed.hours) || 4;
-    const baseCost = rawCost + hours * 85; // ₹85/hr skilled craft benchmark
+    // Step D: Run Dataset-Assisted Fair Pricing Algorithm
+    const finalRawCost = Number(manualRawCost) || Number(parsed.rawCost) || 150;
+    const finalHours = Number(manualHours) || Number(parsed.hours) || 4;
 
-    const pricing = {
-      floorPrice: Math.round(baseCost * 1.1),
-      recommendedPrice: Math.round(baseCost * 1.35),
-      exhibitionPrice: Math.round(baseCost * 1.7),
-    };
+    const pricingCalculation = await pricingService.generateFairPricing({
+      title: parsed.titleEn,
+      category: parsed.category,
+      material: parsed.material,
+      craftSpecialty: craftSpecialty || parsed.category,
+      location: location || "India",
+      rawMaterialCost: finalRawCost,
+      laborHours: finalHours,
+    });
 
     return res.json({
       ...parsed,
-      rawCost,
-      hours,
-      pricing,
+      rawCost: finalRawCost,
+      hours: finalHours,
+      ...pricingCalculation,
     });
   } catch (error) {
     safeUnlink(uploadedFilePath);
@@ -151,7 +237,27 @@ Return ONLY valid JSON with this schema:
   }
 });
 
-// 2. Upload Photo Route
+// ============================================================================
+// 3. Validate Artisan Desired Price Against Fair Range (The Flowchart Engine)
+// ============================================================================
+router.post("/validate-seller-price", async (req, res) => {
+  try {
+    const { sellerPrice, pricing } = req.body;
+    if (!sellerPrice || !pricing) {
+      return res.status(400).json({ error: "sellerPrice and pricing range are required." });
+    }
+
+    const validation = pricingService.validateSellerPrice(sellerPrice, pricing);
+    return res.json(validation);
+  } catch (err) {
+    console.error("Validation error:", err);
+    return res.status(500).json({ error: "Price validation calculation failed." });
+  }
+});
+
+// ============================================================================
+// 4. Upload Photo Route
+// ============================================================================
 router.post("/upload-photo", upload.single("image"), (req, res) => {
   try {
     if (!req.file) {
@@ -166,21 +272,96 @@ router.post("/upload-photo", upload.single("image"), (req, res) => {
   }
 });
 
-// 3. Save Product to Database (Protected: Attaches logged-in Artisan ID)
+// ============================================================================
+// 5. Save Product to DB + Conditionally Export to Excel if Category is Brand New
+// ============================================================================
 router.post("/save", verifyToken, async (req, res) => {
   try {
+    const {
+      titleEn,
+      titleHi,
+      category,
+      material,
+      descriptionEn,
+      descriptionHi,
+      imageUrl,
+      rawCost,
+      hours,
+      pricing,
+      sellerPrice,
+    } = req.body;
+
+    const finalPrice = Number(sellerPrice) || pricing?.recommendedPrice || 0;
+    const normalizedCategory = (category || "Handicrafts").trim();
+
+    // 1. Check if the category exists in the baseline benchmarks BEFORE inserting
+    const isExistingCategory = await pricingService.doesCategoryExist(normalizedCategory);
+
+    // 2. Create and save active product listing
     const product = new Product({
-      ...req.body,
-      artisan: req.user.id, // Linked to logged-in user
+      artisan: req.user.id,
+      titleEn,
+      titleHi,
+      category: normalizedCategory,
+      material,
+      descriptionEn,
+      descriptionHi,
+      imageUrl,
+      rawCost: Number(rawCost) || 0,
+      hours: Number(hours) || 0,
+      pricing: {
+        floorPrice: pricing?.floorPrice || Math.round(finalPrice * 0.8),
+        recommendedPrice: finalPrice,
+        exhibitionPrice: pricing?.exhibitionPrice || Math.round(finalPrice * 1.25),
+      },
+      status: "available",
     });
+
     const savedProduct = await product.save();
+
+    // 3. Prepare benchmark payload
+    const benchmarkPayload = {
+      productName: titleEn,
+      category: normalizedCategory,
+      material: material || "Traditional",
+      craftSpecialty: req.user.craftSpecialty || normalizedCategory,
+      rawMaterialCost: Number(rawCost) || 0,
+      laborHours: Number(hours) || 0,
+      hourlyRate: pricing?.hourlyRate || 85,
+      productionCost: pricing?.totalProductionCost || (Number(rawCost) + Number(hours) * 85),
+      floorPrice: pricing?.floorPrice || Math.round(finalPrice * 0.8),
+      fairPrice: finalPrice,
+      premiumPrice: pricing?.exhibitionPrice || Math.round(finalPrice * 1.25),
+      location: req.user.location || "India",
+      artisanId: req.user.id,
+      verified: true,
+    };
+
+    try {
+      // Save to MongoDB collection for active self-learning
+      await PricingBenchmark.create(benchmarkPayload);
+
+      // ONLY write to Excel if category did NOT previously exist in the dataset!
+      if (!isExistingCategory) {
+        await pricingService.appendToNewDataExcel(benchmarkPayload);
+        console.log(`[NEW CATEGORY DISCOVERED] "${normalizedCategory}" saved to New_Artisan_Contributions.xlsx`);
+      } else {
+        console.log(`[KNOWN CATEGORY] "${normalizedCategory}" already exists in master dataset. Not exported to Excel.`);
+      }
+    } catch (benchErr) {
+      console.warn("Could not record benchmark entry:", benchErr.message);
+    }
+
     return res.status(201).json(savedProduct);
   } catch (error) {
-    return res.status(500).json({ error: error.message });
+    console.error("Save product error:", error);
+    return res.status(500).json({ error: error.message || "Failed to save product" });
   }
 });
 
-// 4. Retrieve All Products for the Logged-In Artisan
+// ============================================================================
+// 6. Retrieve All Products for the Logged-In Artisan
+// ============================================================================
 router.get("/all", verifyToken, async (req, res) => {
   try {
     const products = await Product.find({ artisan: req.user.id }).sort({ createdAt: -1 });
@@ -190,7 +371,9 @@ router.get("/all", verifyToken, async (req, res) => {
   }
 });
 
-// 5. Toggle stock status (Protected: verifies artisan ownership)
+// ============================================================================
+// 7. Toggle Stock Status
+// ============================================================================
 router.patch("/:id/status", verifyToken, async (req, res) => {
   try {
     const { status } = req.body;
@@ -211,13 +394,15 @@ router.patch("/:id/status", verifyToken, async (req, res) => {
       return res.status(404).json({ error: "Product not found or unauthorized." });
     }
 
-    res.json(updated);
+    return res.json(updated);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    return res.status(500).json({ error: error.message });
   }
 });
 
-// 6. Delete a product listing (Protected: verifies artisan ownership)
+// ============================================================================
+// 8. Delete Product Listing
+// ============================================================================
 router.delete("/:id", verifyToken, async (req, res) => {
   try {
     const deleted = await Product.findOneAndDelete({
@@ -229,25 +414,29 @@ router.delete("/:id", verifyToken, async (req, res) => {
       return res.status(404).json({ error: "Product not found or unauthorized." });
     }
 
-    res.json({ message: "Product deleted successfully" });
+    return res.json({ message: "Product deleted successfully" });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    return res.status(500).json({ error: error.message });
   }
 });
 
-// Public Endpoint for Buyers: View all available crafts with artisan details populated
+// ============================================================================
+// 9. Public Discovery Marketplace for Buyers
+// ============================================================================
 router.get("/public/marketplace", async (req, res) => {
   try {
     const products = await Product.find({ status: "available" })
       .populate("artisan", "name craftSpecialty location phone")
       .sort({ createdAt: -1 });
-    res.json(products);
+    return res.json(products);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    return res.status(500).json({ error: error.message });
   }
 });
 
-// Counter-Offer / Fair-Price Evaluation Engine (For Buyers)
+// ============================================================================
+// 10. Buyer Counter-Offer / Ethical Bargain Evaluation Engine
+// ============================================================================
 router.post("/:id/evaluate-offer", async (req, res) => {
   try {
     const { buyerOffer } = req.body;
@@ -271,7 +460,7 @@ router.post("/:id/evaluate-offer", async (req, res) => {
       counterOffer = offer;
     } else if (offer >= floor) {
       status = "negotiable";
-      message = `Your offer covers basic material and standard wage costs, but falls below fair valuation. A reasonable compromise is suggested below.`;
+      message = "Your offer covers basic material and standard wage costs, but falls below fair valuation. A reasonable compromise is suggested below.";
       counterOffer = Math.round((offer + recommended) / 2);
     } else {
       status = "rejected_below_floor";
@@ -280,7 +469,7 @@ router.post("/:id/evaluate-offer", async (req, res) => {
       counterOffer = floor;
     }
 
-    res.json({
+    return res.json({
       status,
       message,
       suggestedCounter: counterOffer,
@@ -290,13 +479,13 @@ router.post("/:id/evaluate-offer", async (req, res) => {
       artisanName: product.artisan?.name,
     });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    return res.status(500).json({ error: error.message });
   }
 });
 
-import Order from "../models/Order.js";
-
-// Buyer places an order
+// ============================================================================
+// 11. Buyer Checkout & Place Order
+// ============================================================================
 router.post("/buy", verifyToken, async (req, res) => {
   try {
     const { productId, finalPrice, shippingAddress } = req.body;
@@ -316,25 +505,27 @@ router.post("/buy", verifyToken, async (req, res) => {
     product.soldAt = new Date();
     await product.save();
 
-    res.status(201).json({ message: "Order placed successfully!", order });
+    return res.status(201).json({ message: "Order placed successfully!", order });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: err.message });
   }
 });
 
-// Buyer views their past orders
+// ============================================================================
+// 12. Buyer Order History
+// ============================================================================
 router.get("/my-orders", verifyToken, async (req, res) => {
   try {
     const orders = await Order.find({ buyer: req.user.id })
       .populate("product")
       .populate("artisan", "name phone")
       .sort({ createdAt: -1 });
-    res.json(orders);
+    return res.json(orders);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: err.message });
   }
 });
 
-// Support both named and default imports in server.js
+// Support both named and default imports
 export { router as productRoutes };
 export default router;
