@@ -48,10 +48,10 @@ app.get("/", (req, res) => {
 
 // 5. Database Connection & Server Listener
 const PORT = process.env.PORT || 5000;
-const MONGO_URI = process.env.MONGO_URI || "mongodb://127.0.0.1:27017/artisan_studio_db";
+const MONGODB_URI = process.env.MONGODB_URI || "mongodb://127.0.0.1:27017/artisan_studio_db";
 
 mongoose
-  .connect(MONGO_URI)
+  .connect(MONGODB_URI)
   .then(async () => {
     console.log("Connected to MongoDB database: artisan_studio_db");
 
