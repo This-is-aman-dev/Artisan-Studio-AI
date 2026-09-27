@@ -256,16 +256,16 @@ router.post("/validate-seller-price", async (req, res) => {
 });
 
 // ============================================================================
-// 4. Upload Photo Route
+// 4. Upload Photo Route (Returns relative path only)
 // ============================================================================
 router.post("/upload-photo", upload.single("image"), (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: "Photo is required." });
     }
-    const host = req.get("host");
-    const protocol = req.protocol;
-    const imageUrl = `${protocol}://${host}/uploads/${req.file.filename}`;
+
+    // Return clean relative path without hardcoded protocols, hosts, or local IPs
+    const imageUrl = `/uploads/${req.file.filename}`;
     return res.json({ imageUrl });
   } catch (error) {
     return res.status(500).json({ error: error.message });
@@ -294,6 +294,17 @@ router.post("/save", verifyToken, async (req, res) => {
     const finalPrice = Number(sellerPrice) || pricing?.recommendedPrice || 0;
     const normalizedCategory = (category || "Handicrafts").trim();
 
+    // Sanitize imageUrl to ensure no local IPs or loopback URLs get saved to DB
+    let cleanImageUrl = imageUrl || "";
+    if (cleanImageUrl) {
+      // Strip out http://localhost:5000, http://127.0.0.1:5000, or http://10.x.x.x:5000
+      cleanImageUrl = cleanImageUrl.replace(/^http:\/\/[^/]+/, "");
+      // Ensure it starts with / if it's a relative path
+      if (!cleanImageUrl.startsWith("http://") && !cleanImageUrl.startsWith("https://") && !cleanImageUrl.startsWith("/")) {
+        cleanImageUrl = `/${cleanImageUrl}`;
+      }
+    }
+
     // 1. Check if the category exists in the baseline benchmarks BEFORE inserting
     const isExistingCategory = await pricingService.doesCategoryExist(normalizedCategory);
 
@@ -306,7 +317,7 @@ router.post("/save", verifyToken, async (req, res) => {
       material,
       descriptionEn,
       descriptionHi,
-      imageUrl,
+      imageUrl: cleanImageUrl,
       rawCost: Number(rawCost) || 0,
       hours: Number(hours) || 0,
       pricing: {
