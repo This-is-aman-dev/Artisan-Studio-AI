@@ -45,7 +45,7 @@ app.use("/api/products", productRoutes);
 
 // Health check endpoint
 app.get("/", (req, res) => {
-  res.send("Artisan Studio AI API is up and running!");
+  res.send("KalaKriti AI API is up and running!");
 });
 
 // Debug route to see what files exist on Render's disk
@@ -96,7 +96,7 @@ mongoose
 
     app.listen(PORT, "0.0.0.0", () => {
       console.log(
-        `Server running on port ${PORT} (All interfaces: 0.0.0.0)`
+        `KalaKriti Server running on port ${PORT} (All interfaces: 0.0.0.0)`
       );
     });
   })
